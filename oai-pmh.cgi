@@ -1,27 +1,28 @@
 #!/oracle/app/oracle/product/11.2.0/db_1/perl/bin/perl
-#  
+#
 # OAI-PMH repository script for Voyager
-#  
+#
 # Copyright (c) 2005-2014 University Of Helsinki (The National Library Of Finland)
-#  
+#
 # This file is part of voyager-oai-pmh-provider
-#  
+#
 # voyager-oai-pmh-provider is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
 # published by the Free Software Foundation, either version 3 of the
 # License, or (at your option) any later version.
-#  
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-#  
+#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
 # Original author: Ere Maijala
-# Version 2.13.1
+# Version 2.13.2
+
 use strict;
 use warnings;
 use Cwd 'abs_path';
@@ -2164,7 +2165,7 @@ sub normalize_id($)
 
   $str = uc($str);
   $str =~ s/-//g;
-  $str =~ s/[\.\(\)\/\,]//g;
+  $str =~ s/[\.\(\)\/\,_]//g;
   $str =~ s/ $//g;
   return $str;
 }
