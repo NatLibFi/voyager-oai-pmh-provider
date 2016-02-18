@@ -2,7 +2,7 @@
 #
 # OAI-PMH repository script for Voyager
 #
-# Copyright (c) 2005-2014 University Of Helsinki (The National Library Of Finland)
+# Copyright (c) 2005-2016 University Of Helsinki (The National Library Of Finland)
 #
 # This file is part of voyager-oai-pmh-provider
 #
@@ -21,7 +21,7 @@
 #
 
 # Original author: Ere Maijala
-# Version 2.13.2
+# Version 2.13.3
 
 use strict;
 use warnings;
@@ -780,6 +780,7 @@ select ID, (MOD_DATE - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE f
         if ((!$from || $del_date_str ge $from) && (!$until || $del_date_str le $until))
         {
           my $rec_id_del = get_field($record, '001');
+          $rec_id_del =~ s/[^0-9]//g;
 
           debug_out("Deleted Match: rec=$rec_id_del, from=" . (defined($from) ? $from : '-') .
             ", until=" . (defined($until) ? $until : '-') .
@@ -909,6 +910,7 @@ select ID, (MOD_DATE - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE f
         if ((!$from || $del_date_str ge $from) && (!$until || $del_date_str le $until))
         {
           my $rec_id_del = get_field($record, '004');
+          $rec_id_del =~ s/[^0-9]//g;
 
           # Date matches. Now check that the record still exists and get its date
           $mfhd_bib_sth->execute($rec_id_del) || die $dbh->errstr;
