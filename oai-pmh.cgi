@@ -21,7 +21,7 @@
 #
 
 # Original author: Ere Maijala
-# Version 2.13.3
+# Version 2.13.4
 
 use strict;
 use warnings;
@@ -1637,7 +1637,11 @@ sub del_date_local_unix_time_to_oai_datetime($)
   --$mon;
   $year -= 1900;
 
-  return timegm($sec, $min, $hour, $mday, $mon, $year);
+  # Default to 1980-01-01 for invalid dates
+  my $date = eval { timegm($sec, $min, $hour, $mday, $mon, $year) }
+    || return timegm(0, 0, 0, 1, 0, 1980);
+
+  return $date;
 }
 
 sub get_attrib($$)
