@@ -21,7 +21,7 @@
 #
 
 # Original author: Ere Maijala
-# Version 2.13.4
+# Version 2.13.5
 
 use strict;
 use warnings;
@@ -1176,7 +1176,7 @@ sub create_location_rule($$)
     $location_rule .= ' and ' if ($location_rule);
     $location_rule .= "$column_name not in ($exclusion)";
   }
-  return $location_rule;
+  return ($location_rule, $exclusion && !$inclusion);
 }
 
 sub create_sql_rules($$$$$$$$$)
@@ -1195,21 +1195,26 @@ sub create_sql_rules($$$$$$$$$)
 
   if ($locations)
   {
-    my $location_rule = create_location_rule('LOCATION_ID', $locations);
-    $sql_where2 .= "${sql_join2}ID in (select BM.BIB_ID from ${db_tablespace}BIB_MFHD BM inner join ${db_tablespace}MFHD_MASTER MM on MM.MFHD_ID=BM.MFHD_ID where $location_rule)";
+    my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $locations);
+    $sql_where2 .= "${sql_join2}(ID in (select BM.BIB_ID from ${db_tablespace}BIB_MFHD BM inner join ${db_tablespace}MFHD_MASTER MM on MM.MFHD_ID=BM.MFHD_ID where $location_rule)";
+    if ($only_exclusions)
+    {
+      $sql_where2 .= " OR ID not in (select BM.BIB_ID from ${db_tablespace}BIB_MFHD BM)";
+    }
+    $sql_where2 .= ')';
     $sql_join2 = $rule_operator;
   }
 
   if ($create_locations)
   {
-    my $location_rule = create_location_rule('LOCATION_ID', $create_locations);
+    my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $create_locations);
     $sql_where2 .= "${sql_join2}ID in (select BH.BIB_ID from ${db_tablespace}BIB_HISTORY BH where ACTION_TYPE_ID=1 AND $location_rule)";
     $sql_join2 = $rule_operator;
   }
 
   if ($happening_locations)
   {
-    my $location_rule = create_location_rule('LOCATION_ID', $happening_locations);
+    my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $happening_locations);
     $sql_where2 .= "${sql_join2}ID in (select BH.BIB_ID from ${db_tablespace}BIB_HISTORY BH where $location_rule)";
     $sql_join2 = $rule_operator;
   }
