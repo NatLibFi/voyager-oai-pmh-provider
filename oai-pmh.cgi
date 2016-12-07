@@ -21,7 +21,7 @@
 #
 
 # Original author: Ere Maijala
-# Version 2.13.5
+# Version 2.13.6
 
 use strict;
 use warnings;
@@ -1047,16 +1047,17 @@ select ID, (MOD_DATE - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE f
         }
         $marc_sth->finish();
       }
-      # Deleted records shouldn't exist in the database, so make them changed instead
-      substr($marcdata, 5, 1) = 'c' if (substr($marcdata, 5, 1) eq 'd');
+
+      if (!$response_sent)
+      {
+        printf("%s", $response);
+        $response_sent = 1;
+      }
 
       if (!defined($filter) || $filter->($marcdata, $rec_id, $dbh, \$marcdata))
       {
-        if (!$response_sent)
-        {
-          printf("%s", $response);
-          $response_sent = 1;
-        }
+        # Deleted records shouldn't exist in the database, so make them changed instead
+        substr($marcdata, 5, 1) = 'c' if (substr($marcdata, 5, 1) eq 'd');
 
         printf("%s%s%s", $record_prefix,
           create_record($dbh, $rec_id, $rec_date, $marcdata, $verb, $prefix, $is_auth, $set),
@@ -1083,8 +1084,13 @@ select ID, (MOD_DATE - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE f
             ++$count;
           }
         }
-        last if (++$count >= $config{'max_records'});
+      } else {
+        # Report records that don't match the filter as deleted
+        substr($marcdata, 5, 1) = 'd';
+        printf("%s%s%s", $record_prefix,
+          create_record($dbh, $rec_id, $rec_date, $marcdata, $verb, $prefix, $is_auth, $set), $record_suffix);
       }
+      last if (++$count >= $config{'max_records'});
     }
     last if (!$found_records);
     $sth->finish() if (defined($sth));
