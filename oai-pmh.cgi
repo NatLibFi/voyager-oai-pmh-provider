@@ -1,4 +1,7 @@
-#!/oracle/app/oracle/product/11.2.0/db_1/perl/bin/perl
+#!/opt/CSCperl/current/bin/perl
+#
+# Check the above perl location. The correct location could be something like
+# #!/oracle/app/oracle/product/11.2.0/db_1/perl/bin/perl
 #
 # OAI-PMH repository script for Voyager
 #
