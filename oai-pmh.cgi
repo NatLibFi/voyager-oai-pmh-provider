@@ -1,7 +1,7 @@
 #!/opt/CSCperl/current/bin/perl
 #
 # Check the above perl location. The correct location could be something like
-# #!/oracle/app/oracle/product/11.2.0/db_1/perl/bin/perl
+# #!/oracle/app/oracle/product/12.1.0.2/db_1/perl/bin/perl
 #
 # OAI-PMH repository script for Voyager
 #
@@ -24,7 +24,7 @@
 #
 
 # Original author: Ere Maijala
-# Version 2.13.6
+# Version 3.0.0
 
 use strict;
 use warnings;
@@ -52,6 +52,8 @@ use Encode;
 use File::stat;
 use POSIX;
 use Storable;
+use File::Spec;
+use File::Temp qw/ tempfile /;
 
 sub send_http_headers();
 sub send_http_error($);
@@ -67,7 +69,7 @@ sub get_attrib($$);
 sub url_decode($);
 sub url_encode($);
 sub send_error($$);
-sub create_record($$$$$$$$);
+sub create_record($$$$$$$$$);
 sub create_id($$);
 sub id_to_rec_id($);
 sub convert_to_oai_dc($$$);
@@ -79,7 +81,7 @@ sub cleanup_str($);
 sub check_params($);
 sub check_dates($$);
 sub get_record_sets($$$$$$);
-sub create_sql_rules($$$$$$$$$);
+sub match_record($$$);
 sub addr_to_num($);
 sub marc_to_list($);
 sub list_to_marc($);
@@ -118,6 +120,9 @@ my $db_tablespace = '';
 my $field_start = "\x1f";
 my $field_end = "\x1e";
 my $record_end = "\x1d";
+
+my $response = '';
+my $response_sent = 0;
 
 # MAIN ###########################
 {
@@ -206,6 +211,8 @@ sub get_record()
   my $oai_id = param('identifier');
   my ($rec_id, $is_auth) = id_to_rec_id($oai_id);
 
+  $rec_id =~ s/[^\d]*//g;
+
   send_http_headers();
 
   if ($rec_id eq '')
@@ -256,13 +263,13 @@ sub get_record()
 
   substr($marcdata, 5, 1) = 'c' if (substr($marcdata, 5, 1) eq 'd');
 
-  my $response = oai_header();
+  $response = oai_header();
   $response .= qq|  <request verb="GetRecord" identifier="$oai_id" metadataPrefix="$prefix">$request</request>
   <GetRecord>
     <record>
 |;
 
-  $response .= create_record($dbh, $rec_id, $mod_date, $marcdata, 'getrecord', $prefix, $is_auth, undef);
+  $response .= create_record($dbh, $rec_id, $mod_date, $marcdata, 'getrecord', $prefix, $is_auth, undef, undef);
 
   $response .= qq|    </record>
   </GetRecord>
@@ -288,7 +295,7 @@ sub identify()
   my $earliest_timestamp = local_unix_time_to_oai_datetime($row[0], 1);
 
   my $sample_id = create_id(123, 0);
-  my $response = oai_header();
+  $response = oai_header();
   $response .= qq|  <request verb="Identify">$request</request>
   <Identify>
     <repositoryName>$config{'repository_name'}</repositoryName>
@@ -358,7 +365,7 @@ sub list_metadata_formats()
     }
   }
 
-  my $response = oai_header();
+  $response = oai_header();
 
   my $identifier = $oai_id ? " identifier=\"$oai_id\"" : '';
 
@@ -393,7 +400,7 @@ sub list_sets()
     send_error('noSetHierarchy', '');
   }
 
-  my $response = oai_header();
+  $response = oai_header();
   $response .= qq|  <request verb="ListSets">$request</request>
   <ListSets>
 |;
@@ -436,6 +443,8 @@ sub retrieve_records($)
   my $deletions_pos = 0;
   my $deletions_index = 0;
   my $mfhd_deletions_pos = 0;
+  my $set_file = '';
+  my $spos = 0;
 
   debug_out("retrieve_records $verb", 0);
 
@@ -449,9 +458,10 @@ sub retrieve_records($)
     $cursor_pos = get_attrib($token, 'pos');
     $deletions_pos = get_attrib($token, 'del');
     $deletions_index = get_attrib($token, 'delindex');
-    $mfhd_deletions_pos = get_attrib($token, 'mdel');
+    $set_file = get_attrib($token, 'id');
+    $spos = get_attrib($token, 'spos');
 
-    if ($prefix eq '' || ($cursor_pos eq '' && !$deletions_pos))
+    if ($prefix eq '' || ($cursor_pos eq '' && !$deletions_pos) || ($deletions_pos == -1 && !$set_file))
     {
       send_http_headers();
       send_error('badResumptionToken', '');
@@ -487,51 +497,25 @@ sub retrieve_records($)
     return;
   }
 
-  my @sets = @{$config{'sets'}};
-
   my $is_auth = 0;
-  my $rec_formats = '';
-  my $locations = '';
-  my $create_locations = '';
-  my $happening_locations = '';
   my $keyword = '';
   my $filter;
-  my $mfhd_callno = '';
-  my $pub_places = '';
-  my $languages = '';
   my $component_parts = 0;
-  my $suppressed = 0;
   my $rule_operator = ' and ';
+  my $selected_set;
   if ($set)
   {
-    my $found = 0;
-    foreach my $setspec (@sets)
-    {
-      if ($setspec->{'id'} eq $set)
-      {
-        $found = 1;
-        $is_auth = 1 if ($setspec->{'record_type'} && $setspec->{'record_type'} eq 'A');
-        $rec_formats = $setspec->{'rec_formats'};
-        $locations = $setspec->{'locations'};
-        $create_locations = $setspec->{'create_locations'};
-        $happening_locations = $setspec->{'happening_locations'};
-        $keyword = $setspec->{'keyword'};
-        $filter = $setspec->{'filter'};
-        $mfhd_callno = $setspec->{'mfhd_callno'};
-        $pub_places = $setspec->{'pub_places'};
-        $languages = $setspec->{'languages'};
-        $component_parts = $setspec->{'component_parts'};
-        $suppressed = $setspec->{'suppressed'};
-        $rule_operator = ' or ' if ($setspec->{'rule_operator'} && $setspec->{'rule_operator'} eq 'or');
-        last;
-      }
-    }
-    if (!$found)
+    $selected_set = get_set_by_name($set);
+    if (!defined($selected_set))
     {
       send_http_headers();
       send_error('noRecordsMatch', '');
       return;
     }
+    $is_auth = 1 if ($selected_set->{'record_type'} && $selected_set->{'record_type'} eq 'A');
+    $keyword = $selected_set->{'keyword'};
+    $filter = $selected_set->{'filter'};
+    $component_parts = $selected_set->{'component_parts'};
   }
   elsif (!$config{'return_all_for_empty_set'})
   {
@@ -540,20 +524,16 @@ sub retrieve_records($)
     return;
   }
 
-  my $from_ts = '';
   my $from_unix = 0;
-  my $until_ts = '';
   my $until_unix = 0;
   if ($from)
   {
     $from .= 'T00:00:00Z' if (length($from) == 10);
-    $from_ts = oai_datetime_to_oracle_timestamp($from);
     $from_unix = oai_datetime_to_local_unix_time($from);
   }
   if ($until)
   {
     $until .= 'T23:59:59Z' if (length($until) == 10);
-    $until_ts = oai_datetime_to_oracle_timestamp($until);
     $until_unix = oai_datetime_to_local_unix_time($until);
   }
 
@@ -570,6 +550,504 @@ sub retrieve_records($)
     }
   }
 
+  my $dbh = DBI->connect("dbi:Oracle:$config{'db_params'}", $config{'db_username'}, $config{'db_password'}) || die "Could not connect: $DBI::errstr";
+
+  my $marc_sth;
+  if ($is_auth)
+  {
+     $marc_sth = $dbh->prepare("SELECT RECORD_SEGMENT FROM ${db_tablespace}AUTH_DATA WHERE AUTH_ID=? ORDER BY SEQNUM") || die $dbh->errstr;
+  }
+  else
+  {
+     $marc_sth = $dbh->prepare("SELECT RECORD_SEGMENT FROM ${db_tablespace}BIB_DATA WHERE BIB_ID=? ORDER BY SEQNUM") || die $dbh->errstr;
+  }
+
+  my $kw_comp_sth = $dbh->prepare("SELECT '1' as Found FROM ${db_tablespace}BIB_TEXT WHERE BIB_ID=? AND SUBSTR(BIB_FORMAT, 2, 1) NOT IN ('m', 's')") || die $dbh->errstr;
+
+  my $req_attrs = '';
+  $req_attrs .= " from=\"$from\"" if ($from);
+  $req_attrs .= " until=\"$until\"" if ($until);
+  $req_attrs .= " metadataPrefix=\"$prefix\"";
+  $req_attrs .= " set=\"$set\"" if ($set);
+
+  my $main_tag = $verb;
+  $response = oai_header();
+  $response .= qq|  <request verb="$verb"$req_attrs>$request</request>
+  <$main_tag>
+|;
+
+  my $ofh = select STDOUT;
+  $| = 1;
+  select $ofh;
+
+  $ofh = select STDERR;
+  $| = 1;
+  select $ofh;
+
+  send_http_headers();
+
+  my $keep_alive_time = time();
+  my $count = 0;
+  my $fetched = 0;
+
+  # First find all deletions and send them...
+  my $deleted_file = $is_auth ? $config{'deleted_auth_file'} : $config{'deleted_bib_file'};
+  if (defined($deletions_pos) && $deletions_pos >= 0 && $deleted_file && ($from || $until))
+  {
+    my @deletion_files;
+    # There may be a single string for deletions file, or an array for multiple files
+    if (ref $deleted_file ne 'ARRAY')
+    {
+      @deletion_files = ($deleted_file);
+    }
+    else
+    {
+      @deletion_files = @{$deleted_file};
+    }
+    for (my $index = $deletions_index; $index < scalar(@deletion_files); $index++)
+    {
+      $deleted_file = $deletion_files[$index];
+      if ($index > $deletions_index)
+      {
+        # Opening new file, reset position
+        $deletions_pos = 0;
+      }
+
+      my $df = undef;
+      if (!open($df, "<$deleted_file"))
+      {
+        if ($index == 0)
+        {
+          die("Could not open deletion file $deleted_file: $!");
+        }
+        else
+        {
+          # Don't die if optional deletions file not found
+          next;
+        }
+      }
+      debug_out("Processing deletions file $index: $deleted_file", 0);
+      if ($from_unix > stat($df)->mtime) {
+        debug_out("Skipping $deleted_file, it's older than the 'from' date", 0);
+        close($df);
+        next;
+      }
+
+      if ($deletions_pos == 0)
+      {
+        $deletions_pos = find_marc_file_pos($df, $from);
+        debug_out("Starting deletions file from position $deletions_pos", 0);
+      }
+      else
+      {
+        debug_out("Starting deletions file from requested position $deletions_pos", 0);
+      }
+
+      sysseek($df, $deletions_pos, SEEK_SET);
+      my $del_count = 0;
+      my $len;
+  LOOP:
+      while (my $record = read_marc_record($df, $del_count))
+      {
+        ++$del_count;
+
+        # Check for keep alive time
+        if (abs(time() - $keep_alive_time) > $config{'keep_alive_interval'})
+        {
+          if (!$response_sent)
+          {
+            printf("%s", $response);
+            $response_sent = 1;
+          }
+          printf("\n");
+          $keep_alive_time = time();
+        }
+
+        my $f005a = get_field($record, '005');
+        my $del_date = del_date_local_unix_time_to_oai_datetime(substr($f005a, 0, 14));
+        my $del_date_str = local_unix_time_to_oai_datetime($del_date, 1);
+        if ((!$from || $del_date_str ge $from) && (!$until || $del_date_str le $until))
+        {
+          my $rec_id_del = get_field($record, '001');
+          $rec_id_del =~ s/[^0-9]//g;
+
+          debug_out("Deleted Match: rec=$rec_id_del, from=" . (defined($from) ? $from : '-') .
+            ", until=" . (defined($until) ? $until : '-') .
+            ", del_date=$del_date_str", 1);
+          # Record deletion time matches. Can't really check other rules so just say it's deleted
+          ++$count;
+
+          if (!$response_sent)
+          {
+            printf("%s", $response);
+            $response_sent = 1;
+          }
+
+          printf("%s%s%s", $record_prefix,
+            create_record($dbh, $rec_id_del, $del_date, $record, $verb, $prefix, $is_auth, $set, $selected_set),
+            $record_suffix);
+
+          if ($count >= $config{'max_records'})
+          {
+            # Create a resumption token
+            $token = url_encode(sprintf("from=%s&until=%s&set=%s&metadataPrefix=%s&pos=%d&del=%d&delindex=%d",
+              $from ? $from : '', $until ? $until : '', $set ? $set : '', $prefix, ($cursor_pos + $fetched), sysseek($df, 0, SEEK_CUR), $index));
+            printf("    <resumptionToken cursor=\"%ld\">%s</resumptionToken>\n", $cursor_pos, $token);
+
+            debug_out("$config{'max_records'} deleted records sent, resumptionToken $token", 0);
+            close($df);
+            printf("  </$main_tag>\n</OAI-PMH>\n");
+            return;
+          }
+        }
+      }
+      close($df);
+    }
+    debug_out("$count deleted records sent", 0);
+  }
+
+  my $tmpdir = $config{'temp_dir'} || File::Spec->tmpdir();
+
+  my $mfhd_bib_sth = undef;
+  my $set_fh;
+  if ($set_file)
+  {
+    my $full_set_file = "$tmpdir/voyager-oai-pmh-set-$set_file";
+    my $mtime = time();
+    # Touch the file to keep it from expiring
+    utime $mtime, $mtime, ($full_set_file);
+    if (!open($set_fh, "<$full_set_file"))
+    {
+      warn("Could not open $full_set_file for reading or seek to $spos");
+      if (!$response_sent)
+      {
+        printf("%s", $response);
+        $response_sent = 1;
+      }
+      send_error('badResumptionToken', '');
+      return;
+    }
+    binmode $set_fh;
+    if (!seek($set_fh, $spos, SEEK_SET)) {
+      warn("Could not seek $full_set_file to $spos");
+      if (!$response_sent)
+      {
+        printf("%s", $response);
+        $response_sent = 1;
+      }
+      send_error('badResumptionToken', '');
+      return;
+    }
+  } else {
+    # Clean up expired sets
+    foreach my $old_file (glob("$tmpdir/voyager-oai-pmh-set-*"))
+    {
+      my $fileAttrs = stat($old_file);
+      if (time() - $fileAttrs->mtime > 60 * 60) # 1 hour
+      {
+        debug_out("Removing expired set file $old_file", 0);
+        unlink($old_file) || debug_out("Could not remove expired set file $old_file: $!", 0);
+      }
+    }
+
+    my (undef, $tmp) = tempfile('XXXXXXXX', OPEN => 0);
+    $set_file = $tmp;
+    my $full_set_file = "$tmpdir/voyager-oai-pmh-set-$set_file";
+
+    create_set_file($full_set_file, $from, $until, $dbh, $is_auth);
+    open($set_fh, "<$full_set_file") || die ("Could not open $full_set_file for reading: $!");
+  }
+
+  while (my $row = <$set_fh>)
+  {
+    chomp($row);
+    my ($rec_date, $rec_id) = split(/\|/, $row);
+    debug_out("retrieve_records: processing rec id $rec_id, date $rec_date", 1);
+
+    $rec_date = oai_datetime_to_local_unix_time($rec_date);
+    $rec_id = int($rec_id);
+
+    if (abs(time() - $keep_alive_time) > $config{'keep_alive_interval'})
+    {
+      if (!$response_sent)
+      {
+        printf("%s", $response);
+        $response_sent = 1;
+      }
+      printf("\n");
+      $keep_alive_time = time();
+    }
+
+    my $marcdata = '';
+    $marc_sth->execute($rec_id) || die $dbh->errstr;
+    while (my (@marcrow2) = $marc_sth->fetchrow_array)
+    {
+      $marcdata .= $marcrow2[0];
+    }
+    $marc_sth->finish();
+
+    my $record_matched = 1;
+    if ($keyword)
+    {
+      if (!$id_hash{$rec_id})
+      {
+        if (!$component_parts)
+        {
+          $record_matched = 0;
+        }
+        elsif ($component_parts == 1)
+        {
+          debug_out("retrieve_records: checking if $rec_id is component...", 1);
+          $kw_comp_sth->execute($rec_id) || die($dbh->errstr);
+          my $found = $kw_comp_sth->fetchrow_array();
+          $kw_comp_sth->finish();
+          if ($found)
+          {
+            debug_out("retrieve_records: $rec_id is component, checking for host item...", 1);
+            # Fetch MARC data first
+            $marc_sth->execute($rec_id) || die $dbh->errstr;
+            while (my (@marcrow) = $marc_sth->fetchrow_array())
+            {
+              $marcdata .= $marcrow[0];
+            }
+            $marc_sth->finish();
+
+            # Check if the keyword term matches the host item of this component part
+            my $host_ref = get_linked_records($dbh, $marcdata, 'HOST');
+            my %host = %$host_ref;
+            $record_matched = 0 if (scalar(keys %host) == 0 || !$id_hash{(keys %host)[0]});
+          }
+          else
+          {
+            $record_matched = 0;
+          }
+        }
+        else
+        {
+          $record_matched = 0;
+        }
+      }
+      debug_out("retrieve_records: record $rec_id keyword match: $record_matched", 1);
+    }
+
+    if (!$response_sent)
+    {
+      printf("%s", $response);
+      $response_sent = 1;
+    }
+
+    if ($record_matched && defined($selected_set))
+    {
+      $record_matched = match_record($dbh, \$selected_set, $rec_id);
+      debug_out("retrieve_records: record $rec_id rule match: $record_matched", 1);
+    }
+    if ($record_matched && defined($filter)) {
+      $record_matched = $filter->($marcdata, $rec_id, $dbh, \$marcdata);
+      debug_out("retrieve_records: record $rec_id filter match: $record_matched", 1);
+    }
+
+    if ($record_matched)
+    {
+      # Deleted records shouldn't exist in the database, so make them changed instead
+      substr($marcdata, 5, 1) = 'c' if (substr($marcdata, 5, 1) eq 'd');
+
+      printf("%s%s%s", $record_prefix,
+        create_record($dbh, $rec_id, $rec_date, $marcdata, $verb, $prefix, $is_auth, $set, $selected_set),
+        $record_suffix);
+
+      if ($component_parts && $component_parts == 2)
+      {
+        # Fetch all component parts for this host item
+        my $component_parts_ref = get_linked_records($dbh, $marcdata, 'COMP');
+        my %component_parts = %$component_parts_ref;
+        foreach my $component_id (keys %component_parts)
+        {
+          my $comp_marcdata = '';
+          $marc_sth->execute($component_id) || die $dbh->errstr;
+          while (my (@marcrow3) = $marc_sth->fetchrow_array())
+          {
+            $comp_marcdata .= $marcrow3[0];
+          }
+          $marc_sth->finish();
+
+          printf("%s%s%s", $record_prefix,
+            create_record($dbh, $component_id, $component_parts{$component_id}, $comp_marcdata, $verb, $prefix, $is_auth, $set, $selected_set),
+            $record_suffix);
+          ++$count;
+        }
+      }
+    } else {
+      # Report records that don't match as deleted
+      if (length($marcdata) < 24)
+      {
+        $marcdata = '00961dam a22000000z 4500' . $record_end;
+      }
+      else
+      {
+        substr($marcdata, 5, 1) = 'd';
+      }
+      printf("%s%s%s", $record_prefix,
+        create_record($dbh, $rec_id, $rec_date, $marcdata, $verb, $prefix, $is_auth, $set, $selected_set), $record_suffix);
+    }
+    last if (++$count >= $config{'max_records'});
+  }
+  $dbh->disconnect();
+
+  if ($count == 0)
+  {
+    # No records found
+    send_error('noRecordsMatch', '');
+    return;
+  }
+
+  if ($count >= $config{'max_records'})
+  {
+    # Create a resumption token
+    $token = url_encode(sprintf("from=%s&until=%s&set=%s&metadataPrefix=%s&pos=%d&del=-1&id=%s&spos=%d",
+      $from ? $from : '', $until ? $until : '', $set ? $set : '', $prefix, ($cursor_pos + $count), $set_file, tell($set_fh)));
+    printf("    <resumptionToken cursor=\"%ld\">%s</resumptionToken>\n", $cursor_pos, $token);
+
+    debug_out("$config{'max_records'} sent, resumptionToken $token", 0);
+  }
+  else
+  {
+    debug_out("$count sent", 0);
+  }
+  close($set_fh);
+  printf("  </$main_tag>\n</OAI-PMH>\n");
+}
+
+sub create_set_file($$$$$)
+{
+  my ($filename, $from, $until, $dbh, $is_auth) = @_;
+
+  my $set_fh;
+  open($set_fh, ">$filename.tmp") || die("Could not open $filename.tmp for writing: $!");
+
+  # Handle deleted holdings
+  my $keep_alive_time = time();
+  if (defined($config{'deleted_bib_file'}) && !defined($config{'deleted_mfhd_file'}))
+  {
+    # Deleted MFHD file not specified, take from bib and modify
+    $config{'deleted_mfhd_file'} = ();
+    my @bibfiles;
+    my $deleted_file = $config{'deleted_bib_file'};
+    if (ref $deleted_file ne 'ARRAY')
+    {
+      @bibfiles = ($deleted_file);
+    }
+    else
+    {
+      @bibfiles = @{$deleted_file};
+    }
+    for (my $i = 0; $i < scalar(@bibfiles); $i++)
+    {
+      my $filename = $bibfiles[$i];
+      if ($filename =~ s/\.bib\./.mfhd./g)
+      {
+        debug_out("Autoconfigured mfhd deletions file: $filename", 0);
+        push(@{$config{'deleted_mfhd_file'}}, $filename);
+      }
+    }
+  }
+  if ($config{'include_holdings'} && !$is_auth && defined($config{'deleted_mfhd_file'}) && ($from || $until))
+  {
+    my $mfhd_bib_sth = $dbh->prepare("select (nvl(UPDATE_DATE, CREATE_DATE) - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE from ${db_tablespace}BIB_MASTER where BIB_ID=?");
+
+    debug_out('Building list of deleted holdings...', 0);
+    my $deleted_file = $config{'deleted_mfhd_file'};
+    my @deletion_files;
+    # There may be a single string for deletions file, or an array for multiple files
+    if (ref $deleted_file ne 'ARRAY')
+    {
+      @deletion_files = ($deleted_file);
+    }
+    else
+    {
+      @deletion_files = @{$deleted_file};
+    }
+
+    my $del_match_count = 0;
+    for (my $index = 0; $index < scalar(@deletion_files); $index++)
+    {
+      $deleted_file = $deletion_files[$index];
+      my $df = undef;
+
+      if (!open($df, "<$deleted_file"))
+      {
+        if ($index == 0)
+        {
+          die("Could not open deletion file $deleted_file: $!");
+        }
+        else
+        {
+          # Don't die if optional deletions file not found
+          next;
+        }
+      }
+      debug_out("Processing MFHD deletions file $index: $deleted_file", 0);
+      if ($from && oai_datetime_to_local_unix_time($from) > stat($df)->mtime)
+      {
+        debug_out("Skipping $deleted_file, it's older than the 'from' date", 0);
+        close($df);
+        next;
+      }
+
+      my $position = find_marc_file_pos($df, $from);
+      sysseek($df, $position, SEEK_SET);
+      debug_out("Starting MFHD deletions file from position $position", 0);
+
+      my $del_count = 0;
+      my $len;
+      while (my $record = read_marc_record($df, $del_count))
+      {
+        ++$del_count;
+
+        # Check for keep alive time
+        if (abs(time() - $keep_alive_time) > $config{'keep_alive_interval'})
+        {
+          if (!$response_sent)
+          {
+            printf("%s", $response);
+            $response_sent = 1;
+          }
+          printf("\n");
+          $keep_alive_time = time();
+        }
+
+        my $f005a = get_field($record, '005');
+        my $del_date = del_date_local_unix_time_to_oai_datetime(substr($f005a, 0, 14));
+        my $del_date_str = local_unix_time_to_oai_datetime($del_date, 1);
+        if ((!$from || $del_date_str ge $from) && (!$until || $del_date_str le $until))
+        {
+          my $rec_id_del = get_field($record, '004');
+          $rec_id_del =~ s/[^0-9]//g;
+
+          # Date matches. Now check that the record still exists and get its date
+          $mfhd_bib_sth->execute($rec_id_del) || die $dbh->errstr;
+          my ($rec_date) = $mfhd_bib_sth->fetchrow_array();
+          $mfhd_bib_sth->finish();
+          if ($rec_date)
+          {
+            debug_out("Deleted MFHD Match: bib=$rec_id_del, from=" . (defined($from) ? $from : '-') .
+              ", until=" . (defined($until) ? $until : '-') .
+              ", del_date=$del_date_str", 1);
+            print $set_fh local_unix_time_to_oai_datetime($rec_date, 1) . "|$rec_id_del\n";
+            ++$del_match_count;
+          }
+          else
+          {
+            debug_out("Deleted MFHD Match but BIB doesn't exist anymore: bib=$rec_id_del, from=" . (defined($from) ? $from : '-') .
+              ", until=" . (defined($until) ? $until : '-') .
+              ", del_date=$del_date_str", 1);
+          }
+        }
+      }
+      close($df);
+    }
+    debug_out("$del_match_count deleted holdings found", 0);
+  }
+
   my $sql_base;
   my $inner_create_where = '';
   my $inner_update_where = '';
@@ -578,8 +1056,11 @@ sub retrieve_records($)
   my $item_inner_create_where = '';
   my $item_inner_modify_where = '';
   my $inner_where_join = ' WHERE ';
+  my $from_ts = '';
+  my $until_ts = '';
   if ($from)
   {
+    $from_ts = oai_datetime_to_oracle_timestamp($from);
     $inner_create_where = "${inner_where_join}CREATE_DATE >= $from_ts";
     $inner_update_where = "${inner_where_join}UPDATE_DATE >= $from_ts";
     $mfhd_inner_create_where = "${inner_where_join}MM.CREATE_DATE >= $from_ts";
@@ -590,6 +1071,7 @@ sub retrieve_records($)
   }
   if ($until)
   {
+    $until_ts = oai_datetime_to_oracle_timestamp($until);
     $inner_create_where .= "${inner_where_join}CREATE_DATE <= $until_ts";
     $inner_update_where .= "${inner_where_join}UPDATE_DATE <= $until_ts";
     $mfhd_inner_create_where .= "${inner_where_join}MM.CREATE_DATE <= $until_ts";
@@ -651,7 +1133,7 @@ select ID, (MOD_DATE - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE f
   }
   my $sql_join = ' where ';
   my $sql_where = '';
-  my $sql_order = ' order by MOD_DATE, ID';
+  my $sql_order = '';
 
   if ($from)
   {
@@ -664,463 +1146,50 @@ select ID, (MOD_DATE - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE f
     $sql_join = ' and ';
   }
 
-  # Actual rules
-  my $sql_where2 = create_sql_rules($rule_operator, $rec_formats, $locations, $create_locations, $happening_locations, $mfhd_callno, $pub_places, $languages, $suppressed);
+  my $full_sql = "select MOD_DATE, ID from ($sql_base$sql_where$sql_order)";
+  debug_out("Creating recordset from SQL query: $full_sql", 0);
+  my $sth = $dbh->prepare($full_sql) || die $dbh->errstr;
+  $sth->execute() || die $dbh->errstr;
+  debug_out('Recordset created', 0);
 
-  if ($sql_where2)
-  {
-    $sql_where .= "${sql_join}($sql_where2)";
-    $sql_join = ' and ';
-  }
-
-  my $dbh = DBI->connect("dbi:Oracle:$config{'db_params'}", $config{'db_username'}, $config{'db_password'}) || die "Could not connect: $DBI::errstr";
-
-  my $marc_sth;
-  if ($is_auth)
-  {
-     $marc_sth = $dbh->prepare("SELECT RECORD_SEGMENT FROM ${db_tablespace}AUTH_DATA WHERE AUTH_ID=? ORDER BY SEQNUM") || die $dbh->errstr;
-  }
-  else
-  {
-     $marc_sth = $dbh->prepare("SELECT RECORD_SEGMENT FROM ${db_tablespace}BIB_DATA WHERE BIB_ID=? ORDER BY SEQNUM") || die $dbh->errstr;
-  }
-
-  my $kw_comp_sth = $dbh->prepare("SELECT '1' as Found FROM ${db_tablespace}BIB_TEXT WHERE BIB_ID=? AND SUBSTR(BIB_FORMAT, 2, 1) NOT IN ('m', 's')") || die $dbh->errstr;
-
-  my $req_attrs = '';
-  $req_attrs .= " from=\"$from\"" if ($from);
-  $req_attrs .= " until=\"$until\"" if ($until);
-  $req_attrs .= " metadataPrefix=\"$prefix\"";
-  $req_attrs .= " set=\"$set\"" if ($set);
-
-  my $main_tag = $verb;
-  my $response = oai_header();
-  $response .= qq|  <request verb="$verb"$req_attrs>$request</request>
-  <$main_tag>
-|;
-
-  my $ofh = select STDOUT;
-  $| = 1;
-  select $ofh;
-
-  $ofh = select STDERR;
-  $| = 1;
-  select $ofh;
-
-  my $response_sent = 0;
-
-  send_http_headers();
-
-  my $keep_alive_time = time();
   my $count = 0;
-  my $fetched = 0;
-
-  # First find all deletions and send them...
-  my $deleted_file = $is_auth ? $config{'deleted_auth_file'} : $config{'deleted_bib_file'};
-  if (defined($deletions_pos) && $deletions_pos >= 0 && $deleted_file && ($from || $until))
+  while (my @row = $sth->fetchrow_array())
   {
-    my @deletion_files;
-    # There may be a single string for deletions file, or an array for multiple files
-    if (ref $deleted_file ne 'ARRAY')
+    print $set_fh local_unix_time_to_oai_datetime($row[0], 0) . '|' . $row[1] . "\n";
+    # Check for keep alive time
+    if (abs(time() - $keep_alive_time) > $config{'keep_alive_interval'})
     {
-      @deletion_files = ($deleted_file);
-    }
-    else
-    {
-      @deletion_files = @{$deleted_file};
-    }
-    for (my $index = $deletions_index; $index < scalar(@deletion_files); $index++)
-    {
-      $deleted_file = $deletion_files[$index];
-      if ($index > $deletions_index)
-      {
-        # Opening new file, reset position
-        $deletions_pos = 0;
-      }
-
-      my $df = undef;
-      if (!open($df, "<$deleted_file"))
-      {
-        if ($index == 0)
-        {
-          die("Could not open deletion file $deleted_file: $!");
-        }
-        else
-        {
-          # Don't die if optional deletions file not found
-          next;
-        }
-      }
-      debug_out("Processing deletions file $index: $deleted_file", 0);
-      if ($from_unix > stat($df)->mtime) {
-        debug_out("Skipping $deleted_file, it's older than the 'from' date", 0);
-        close($df);
-        next;
-      }
-      sysseek($df, $deletions_pos, SEEK_SET);
-      my $del_count = 0;
-      my $len;
-  LOOP:
-      while (my $record = read_marc_record($df, $del_count))
-      {
-        ++$del_count;
-
-        # Check for keep alive time
-        if (abs(time() - $keep_alive_time) > $config{'keep_alive_interval'})
-        {
-          if (!$response_sent)
-          {
-            printf("%s", $response);
-            $response_sent = 1;
-          }
-          printf("\n");
-          $keep_alive_time = time();
-        }
-
-        my $f005a = get_field($record, '005');
-        my $del_date = del_date_local_unix_time_to_oai_datetime(substr($f005a, 0, 14));
-        my $del_date_str = local_unix_time_to_oai_datetime($del_date, 1);
-        if ((!$from || $del_date_str ge $from) && (!$until || $del_date_str le $until))
-        {
-          my $rec_id_del = get_field($record, '001');
-          $rec_id_del =~ s/[^0-9]//g;
-
-          debug_out("Deleted Match: rec=$rec_id_del, from=" . (defined($from) ? $from : '-') .
-            ", until=" . (defined($until) ? $until : '-') .
-            ", del_date=$del_date_str", 1);
-          # Record deletion time matches. Can't really check other rules so just say it's deleted
-          ++$count;
-
-          if (!$response_sent)
-          {
-            printf("%s", $response);
-            $response_sent = 1;
-          }
-
-          printf("%s%s%s", $record_prefix,
-            create_record($dbh, $rec_id_del, $del_date, $record, $verb, $prefix, $is_auth, $set),
-            $record_suffix);
-
-          if ($count >= $config{'max_records'})
-          {
-            # Create a resumption token
-            $token = url_encode(sprintf("from=%s&until=%s&set=%s&metadataPrefix=%s&pos=%d&del=%d&delindex=%d&mdel=0",
-              $from ? $from : '', $until ? $until : '', $set ? $set : '', $prefix, ($cursor_pos + $fetched), sysseek($df, 0, SEEK_CUR), $index));
-            printf("    <resumptionToken cursor=\"%ld\">%s</resumptionToken>\n", $cursor_pos, $token);
-
-            debug_out("$config{'max_records'} deleted records sent, resumptionToken $token", 0);
-            close($df);
-            printf("  </$main_tag>\n</OAI-PMH>\n");
-            return;
-          }
-        }
-      }
-      close($df);
-    }
-  }
-  debug_out("$count deleted records sent", 0);
-
-  my $mfhd_bib_sth = undef;
-  my %deleted_mfhd_bib_ids = ();
-
-  # Handle deleted holdings first
-  # TODO: check if file age is older than 'from' and bypass
-  if (defined($config{'deleted_bib_file'}) && !defined($config{'deleted_mfhd_file'}))
-  {
-    # Deleted MFHD file not specified, take from bib and modify
-    $config{'deleted_mfhd_file'} = ();
-    my @bibfiles;
-    my $deleted_file = $config{'deleted_bib_file'};
-    if (ref $deleted_file ne 'ARRAY')
-    {
-      @bibfiles = ($deleted_file);
-    }
-    else
-    {
-      @bibfiles = @{$deleted_file};
-    }
-    for (my $i = 0; $i < scalar(@bibfiles); $i++)
-    {
-      my $filename = $bibfiles[$i];
-      if ($filename =~ s/\.bib\./.mfhd./g)
-      {
-        debug_out("Autoconfigured mfhd deletions file: $filename", 0);
-        push(@{$config{'deleted_mfhd_file'}}, $filename);
-      }
-    }
-  }
-  if ($config{'include_holdings'} && !$is_auth && defined($config{'deleted_mfhd_file'}) && defined($mfhd_deletions_pos) && $mfhd_deletions_pos >= 0 && ($from || $until))
-  {
-    my $mfhd_bib_sth = $dbh->prepare("select (nvl(UPDATE_DATE, CREATE_DATE) - TO_DATE('01-01-1970','DD-MM-YYYY')) * 86400 as MOD_DATE from ${db_tablespace}BIB_MASTER where BIB_ID=?");
-
-    debug_out('Building list of deleted holdings...', 0);
-    my $deleted_file = $config{'deleted_mfhd_file'};
-    my @deletion_files;
-    # There may be a single string for deletions file, or an array for multiple files
-    if (ref $deleted_file ne 'ARRAY')
-    {
-      @deletion_files = ($deleted_file);
-    }
-    else
-    {
-      @deletion_files = @{$deleted_file};
-    }
-    MFHDLOOP: for (my $index = 0; $index < scalar(@deletion_files); $index++)
-    {
-      $deleted_file = $deletion_files[$index];
-      my $df = undef;
-
-      if (!open($df, "<$deleted_file"))
-      {
-        if ($index == 0)
-        {
-          die("Could not open deletion file $deleted_file: $!");
-        }
-        else
-        {
-          # Don't die if optional deletions file not found
-          next;
-        }
-      }
-      debug_out("Processing MFHD deletions file $index: $deleted_file", 0);
-      if ($from_unix > stat($df)->mtime) {
-        debug_out("Skipping $deleted_file, it's older than the 'from' date", 0);
-        close($df);
-        next;
-      }
-      sysseek($df, $deletions_pos, SEEK_SET);
-      my $del_count = 0;
-      my $len;
-      while (my $record = read_marc_record($df, $del_count))
-      {
-        ++$del_count;
-
-        # Check for keep alive time
-        if (abs(time() - $keep_alive_time) > $config{'keep_alive_interval'})
-        {
-          if (!$response_sent)
-          {
-            printf("%s", $response);
-            $response_sent = 1;
-          }
-          printf("\n");
-          $keep_alive_time = time();
-        }
-
-        my $f005a = get_field($record, '005');
-        my $del_date = del_date_local_unix_time_to_oai_datetime(substr($f005a, 0, 14));
-        my $del_date_str = local_unix_time_to_oai_datetime($del_date, 1);
-        if ((!$from || $del_date_str ge $from) && (!$until || $del_date_str le $until))
-        {
-          my $rec_id_del = get_field($record, '004');
-          $rec_id_del =~ s/[^0-9]//g;
-
-          # Date matches. Now check that the record still exists and get its date
-          $mfhd_bib_sth->execute($rec_id_del) || die $dbh->errstr;
-          my ($rec_date) = $mfhd_bib_sth->fetchrow_array();
-          $mfhd_bib_sth->finish();
-          if ($rec_date)
-          {
-            debug_out("Deleted MFHD Match: bib=$rec_id_del, from=" . (defined($from) ? $from : '-') .
-              ", until=" . (defined($until) ? $until : '-') .
-              ", del_date=$del_date_str", 1);
-            # Record deletion time matches. Can't really check other rules here
-            $deleted_mfhd_bib_ids{$rec_id_del} = $rec_date;
-            if (scalar(keys(%deleted_mfhd_bib_ids)) - $mfhd_deletions_pos >= $config{'max_records'}){
-              last MFHDLOOP;
-            }
-          }
-          else
-          {
-            debug_out("Deleted MFHD Match but BIB doesn't exist anymore: bib=$rec_id_del, from=" . (defined($from) ? $from : '-') .
-              ", until=" . (defined($until) ? $until : '-') .
-              ", del_date=$del_date_str", 1);
-          }
-        }
-      }
-      close($df);
-    }
-    debug_out(scalar(keys(%deleted_mfhd_bib_ids)) . ' deleted holdings found', 0);
-  }
-  else
-  {
-    $mfhd_deletions_pos = -1;
-  }
-
-  my @deleted_mfhd_bib_ids_keys = keys(%deleted_mfhd_bib_ids);
-
-  my $fetch_records = $config{'max_records'} + 1;
-  $fetch_records *= 100 if (defined($filter) || $keyword);
-  while ($count < $config{'max_records'})
-  {
-    my $sth = undef;
-    my @row = undef;
-    my $found_records = 0;
-
-    while (1)
-    {
-      my $rec_id = undef;
-      my $rec_date = undef;
-
-      if (defined($mfhd_deletions_pos) && $mfhd_deletions_pos >= 0 && $mfhd_deletions_pos < scalar(@deleted_mfhd_bib_ids_keys))
-      {
-        $rec_id = $deleted_mfhd_bib_ids_keys[$mfhd_deletions_pos++];
-        $rec_date = $deleted_mfhd_bib_ids{$rec_id};
-        $found_records = 1;
-      }
-      else
-      {
-        $mfhd_deletions_pos = -1;
-        if (!defined($sth))
-        {
-          my $full_sql = "select ID, MOD_DATE from (select ROWNUM as RNUM, ID, MOD_DATE from ($sql_base$sql_where$sql_order)) where RNUM between " . ($cursor_pos + $fetched + 1) . " and " . ($cursor_pos + $fetched + $fetch_records);
-          debug_out("Creating recordset from SQL query: $full_sql", 0);
-          $sth = $dbh->prepare($full_sql) || die $dbh->errstr;
-          $sth->execute() || die $dbh->errstr;
-          debug_out('Recordset created', 0);
-        }
-
-        (@row) = $sth->fetchrow_array();
-        last if (!@row);
-        ++$fetched;
-        $found_records = 1;
-        $rec_id = $row[0];
-        $rec_date = $row[1];
-      }
-
-      debug_out("retrieve_records: processing rec id $rec_id", 1);
-
-      if (abs(time() - $keep_alive_time) > $config{'keep_alive_interval'})
-      {
-        if (!$response_sent)
-        {
-          printf("%s", $response);
-          $response_sent = 1;
-        }
-        printf("\n");
-        $keep_alive_time = time();
-      }
-
-      my $marcdata = '';
-
-      if ($keyword && !$id_hash{$rec_id})
-      {
-        if (!$component_parts)
-        {
-          next;
-        }
-        elsif ($component_parts == 1)
-        {
-          debug_out("retrieve_records: checking if $rec_id is component...", 1);
-          $kw_comp_sth->execute($rec_id) || die($dbh->errstr);
-          my $found = $kw_comp_sth->fetchrow_array();
-          $kw_comp_sth->finish();
-          if ($found)
-          {
-            debug_out("retrieve_records: $rec_id is component, checking for host item...", 1);
-            # Fetch MARC data first
-            $marc_sth->execute($rec_id) || die $dbh->errstr;
-            while (my (@marcrow) = $marc_sth->fetchrow_array())
-            {
-              $marcdata .= $marcrow[0];
-            }
-            $marc_sth->finish();
-
-            # Check if the keyword term matches the host item of this component part
-            my $host_ref = get_linked_records($dbh, $marcdata, 'HOST');
-            my %host = %$host_ref;
-            next if (scalar(keys %host) == 0 || !$id_hash{(keys %host)[0]});
-          }
-          else
-          {
-            next;
-          }
-        }
-        else
-        {
-          next;
-        }
-      }
-      else
-      {
-        $marc_sth->execute($rec_id) || die $dbh->errstr;
-        while (my (@marcrow2) = $marc_sth->fetchrow_array)
-        {
-          $marcdata .= $marcrow2[0];
-        }
-        $marc_sth->finish();
-      }
-
       if (!$response_sent)
       {
         printf("%s", $response);
         $response_sent = 1;
       }
-
-      if (!defined($filter) || $filter->($marcdata, $rec_id, $dbh, \$marcdata))
-      {
-        # Deleted records shouldn't exist in the database, so make them changed instead
-        substr($marcdata, 5, 1) = 'c' if (substr($marcdata, 5, 1) eq 'd');
-
-        printf("%s%s%s", $record_prefix,
-          create_record($dbh, $rec_id, $rec_date, $marcdata, $verb, $prefix, $is_auth, $set),
-          $record_suffix);
-
-        if ($component_parts && $component_parts == 2)
-        {
-          # Fetch all component parts for this host item
-          my $component_parts_ref = get_linked_records($dbh, $marcdata, 'COMP');
-          my %component_parts = %$component_parts_ref;
-          foreach my $component_id (keys %component_parts)
-          {
-            my $comp_marcdata = '';
-            $marc_sth->execute($component_id) || die $dbh->errstr;
-            while (my (@marcrow3) = $marc_sth->fetchrow_array())
-            {
-              $comp_marcdata .= $marcrow3[0];
-            }
-            $marc_sth->finish();
-
-            printf("%s%s%s", $record_prefix,
-              create_record($dbh, $component_id, $component_parts{$component_id}, $comp_marcdata, $verb, $prefix, $is_auth, $set),
-              $record_suffix);
-            ++$count;
-          }
-        }
-      } else {
-        # Report records that don't match the filter as deleted
-        substr($marcdata, 5, 1) = 'd';
-        printf("%s%s%s", $record_prefix,
-          create_record($dbh, $rec_id, $rec_date, $marcdata, $verb, $prefix, $is_auth, $set), $record_suffix);
-      }
-      last if (++$count >= $config{'max_records'});
+      printf("\n");
+      $keep_alive_time = time();
     }
-    last if (!$found_records);
-    $sth->finish() if (defined($sth));
+    if (++$count % 100000 == 0) {
+      debug_out("$count rows added to the set", 0);
+    }
   }
-  $dbh->disconnect();
+  debug_out("$count rows added to the set", 0);
+  $sth->finish();
 
-  if (!$response_sent)
-  {
-    # No records found
-    send_error('noRecordsMatch', '');
-    return;
-  }
+  close($set_fh);
 
-  if ($count >= $config{'max_records'})
-  {
-    # Create a resumption token
-    $token = url_encode(sprintf("from=%s&until=%s&set=%s&metadataPrefix=%s&pos=%d&del=-1&mdel=%d",
-      $from ? $from : '', $until ? $until : '', $set ? $set : '', $prefix, ($cursor_pos + $fetched), $mfhd_deletions_pos));
-    printf("    <resumptionToken cursor=\"%ld\">%s</resumptionToken>\n", $cursor_pos, $token);
+  debug_out('Sorting the set file', 0);
+  my @args = ('sort', '-o', "$filename.sort", "$filename.tmp");
+  if (system(@args) != 0) {
+    die("Failed to sort set file $filename.tmp to $filename.sort");
+  }
+  unlink("$filename.tmp");
 
-    debug_out("$config{'max_records'} sent, resumptionToken $token", 0);
+  debug_out('Removing duplicates from the set file', 0);
+  @args = ('uniq', "$filename.sort", $filename);
+  if (system(@args) != 0) {
+    die("Failed to remove duplicate lines from set file $filename.sort writing to $filename");
   }
-  else
-  {
-    debug_out("$count sent", 0);
-  }
-  printf("  </$main_tag>\n</OAI-PMH>\n");
+  unlink("$filename.sort");
+  debug_out('Set file created', 0);
 }
 
 sub create_bib_text_rule($$)
@@ -1188,73 +1257,116 @@ sub create_location_rule($$)
   return ($location_rule, $exclusion && !$inclusion);
 }
 
-sub create_sql_rules($$$$$$$$$)
+sub match_record($$$)
 {
-  my ($rule_operator, $rec_formats, $locations, $create_locations, $happening_locations, $mfhd_callno, $pub_places, $languages, $suppressed) = @_;
+  my ($dbh, $set_ref, $rec_id) = @_;
 
-  my $sql_where2 = '';
-  my $sql_join2 = '';
+  if (!defined($$set_ref->{'match_sth'})) {
+    my $rule_operator = defined($$set_ref->{'rule_operator'}) && $$set_ref->{'rule_operator'} eq 'or' ? ' or ' : ' and ';
+    my $is_auth = $$set_ref->{'record_type'} && $$set_ref->{'record_type'} eq 'A' ? 1 : 0;
+    my $rec_formats = $$set_ref->{'rec_formats'};
+    my $create_locations = $$set_ref->{'create_locations'};
+    my $happening_locations = $$set_ref->{'happening_locations'};
+    my $pub_places = $$set_ref->{'pub_places'};
+    my $languages = $$set_ref->{'languages'};
+    my $locations = $$set_ref->{'locations'};
+    my $mfhd_callno = $$set_ref->{'mfhd_callno'};
+    my $suppressed = $$set_ref->{'suppressed'};
 
-  if ($rec_formats)
-  {
-    my $format_rule = create_bib_text_rule('BIB_FORMAT', $rec_formats);
-    $sql_where2 .= "ID in (select BIB_ID from ${db_tablespace}BIB_TEXT where $format_rule)";
-    $sql_join2 = $rule_operator;
-  }
+    my $sql_where2 = '';
+    my $sql_join2 = '';
 
-  if ($locations)
-  {
-    my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $locations);
-    $sql_where2 .= "${sql_join2}(ID in (select BM.BIB_ID from ${db_tablespace}BIB_MFHD BM inner join ${db_tablespace}MFHD_MASTER MM on MM.MFHD_ID=BM.MFHD_ID where $location_rule)";
-    if ($only_exclusions)
+    my $id_column = $is_auth ? 'MT.AUTH_ID' : 'MT.BIB_ID';
+    my $table = $is_auth ? 'AUTH_MASTER' : 'BIB_MASTER';
+
+    if ($rec_formats)
     {
-      $sql_where2 .= " OR ID not in (select BM.BIB_ID from ${db_tablespace}BIB_MFHD BM)";
+      my $format_rule = create_bib_text_rule('BIB_FORMAT', $rec_formats);
+      $sql_where2 .= "$id_column in (select BIB_ID from ${db_tablespace}BIB_TEXT where $format_rule)";
+      $sql_join2 = $rule_operator;
     }
-    $sql_where2 .= ')';
-    $sql_join2 = $rule_operator;
+
+    if ($create_locations)
+    {
+      my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $create_locations);
+      $sql_where2 .= "${sql_join2}$id_column in (select BH.BIB_ID from ${db_tablespace}BIB_HISTORY BH where ACTION_TYPE_ID=1 AND $location_rule)";
+      $sql_join2 = $rule_operator;
+    }
+
+    if ($happening_locations)
+    {
+      my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $happening_locations);
+      $sql_where2 .= "${sql_join2}$id_column in (select BH.BIB_ID from ${db_tablespace}BIB_HISTORY BH where $location_rule)";
+      $sql_join2 = $rule_operator;
+    }
+
+    if ($pub_places)
+    {
+      my $place_rule = create_bib_text_rule('PLACE_CODE', $pub_places);
+      $sql_where2 .= "${sql_join2}$id_column in (select BIB_ID from ${db_tablespace}BIB_TEXT where $place_rule)";
+      $sql_join2 = $rule_operator;
+    }
+
+    if ($languages)
+    {
+      my $language_rule = create_bib_text_rule('LANGUAGE', $languages);
+      $sql_where2 .= "${sql_join2}$id_column in (select BIB_ID from ${db_tablespace}BIB_TEXT where $language_rule)";
+      $sql_join2 = $rule_operator;
+    }
+
+    if ($config{'include_holdings'} == 0) {
+      if ($locations)
+      {
+        my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $locations);
+        $sql_where2 .= "${sql_join2}($id_column in (select BM2.BIB_ID from ${db_tablespace}BIB_MFHD BM2 inner join ${db_tablespace}MFHD_MASTER MM on MM.MFHD_ID=BM2.MFHD_ID where $location_rule)";
+        if ($only_exclusions)
+        {
+          $sql_where2 .= " OR $id_column not in (select BM2.BIB_ID from ${db_tablespace}BIB_MFHD BM2)";
+        }
+        $sql_where2 .= ')';
+        $sql_join2 = $rule_operator;
+      }
+
+      if ($mfhd_callno)
+      {
+        $sql_where2 .= "${sql_join2}$id_column in (select BIB_ID from ${db_tablespace}BIB_MFHD where MFHD_ID in (select MFHD_ID from ${db_tablespace}MFHD_MASTER where NORMALIZED_CALL_NO like '$mfhd_callno'))";
+        $sql_join2 = $rule_operator;
+      }
+    }
+
+
+    my $sql = "select $id_column from ${db_tablespace}$table MT where $id_column=?";
+
+    # Suppressed record handling must not be affected by the rule operator
+    if (defined($suppressed) && $suppressed == 0)
+    {
+      $sql .= " and MT.SUPPRESS_IN_OPAC='N'";
+    }
+    elsif (!$sql_where2)
+    {
+      $$set_ref->{'match_sth'} = 1;
+      $$set_ref->{'match_rules_empty'} = 1;
+      debug_out("match_record: no rules for set " . $$set_ref->{'id'}, 1);
+    }
+
+    if (!defined($$set_ref->{'match_rules_empty'}))
+    {
+      if ($sql_where2) {
+        $sql .= " and ($sql_where2)";
+      }
+      debug_out("match_record: preparing rule SQL for set " . $$set_ref->{'id'} . ": $sql", 1);
+      $$set_ref->{'match_sth'} = $dbh->prepare($sql) || die $dbh->errstr;
+    }
   }
 
-  if ($create_locations)
-  {
-    my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $create_locations);
-    $sql_where2 .= "${sql_join2}ID in (select BH.BIB_ID from ${db_tablespace}BIB_HISTORY BH where ACTION_TYPE_ID=1 AND $location_rule)";
-    $sql_join2 = $rule_operator;
+  if (defined($$set_ref->{'match_rules_empty'})) {
+    # No rules, just return true
+    return 1;
   }
-
-  if ($happening_locations)
-  {
-    my ($location_rule, $only_exclusions) = create_location_rule('LOCATION_ID', $happening_locations);
-    $sql_where2 .= "${sql_join2}ID in (select BH.BIB_ID from ${db_tablespace}BIB_HISTORY BH where $location_rule)";
-    $sql_join2 = $rule_operator;
-  }
-
-  if ($mfhd_callno)
-  {
-    $sql_where2 .= "${sql_join2}ID in (select BIB_ID from ${db_tablespace}BIB_MFHD where MFHD_ID in (select MFHD_ID from ${db_tablespace}MFHD_MASTER where NORMALIZED_CALL_NO like '$mfhd_callno'))";
-    $sql_join2 = $rule_operator;
-  }
-
-  if ($pub_places)
-  {
-    my $place_rule = create_bib_text_rule('PLACE_CODE', $pub_places);
-    $sql_where2 .= "${sql_join2}ID in (select BIB_ID from ${db_tablespace}BIB_TEXT where $place_rule)";
-    $sql_join2 = $rule_operator;
-  }
-
-  if ($languages)
-  {
-    my $language_rule = create_bib_text_rule('LANGUAGE', $languages);
-    $sql_where2 .= "${sql_join2}ID in (select BIB_ID from ${db_tablespace}BIB_TEXT where $language_rule)";
-    $sql_join2 = $rule_operator;
-  }
-
-  #if ($suppressed && $suppressed eq '0')
-  #{
-  #  $sql_where2 .= "${sql_join2}ID in (select BIB_ID from ${db_tablespace}BIB_MASTER where SUPPRESS_IN_OPAC='N')";
-  #  $sql_join2 = $rule_operator;
-  #}
-
-  return $sql_where2;
+  $$set_ref->{'match_sth'}->execute($rec_id) || die($dbh->errstr);
+  my @row = $$set_ref->{'match_sth'}->fetchrow_array();
+  $$set_ref->{'match_sth'}->finish();
+  return @row ? 1 : 0;
 }
 
 sub oai_header()
@@ -1300,7 +1412,7 @@ sub send_error($$)
     $year + 1900, $mon + 1, $day, $hour, $min, $sec, $ENV{'REMOTE_ADDR'}, $desc, $query_string);
   print STDERR "$msg\n";
 
-  my $response = oai_header();
+  $response = oai_header();
   $response .= qq|  <request>$request</request>
   <error code="$error">$desc</error>
 |;
@@ -1332,39 +1444,15 @@ sub send_http_error($)
   printf("%s\n", $errordesc{$error_code});
 }
 
-sub create_record($$$$$$$$)
+sub create_record($$$$$$$$$)
 {
-  my ($dbh, $rec_id, $date, $marcdata, $verb, $prefix, $is_auth, $set) = @_;
+  my ($dbh, $rec_id, $date, $marcdata, $verb, $prefix, $is_auth, $set, $current_setspec) = @_;
 
   my $identifier = create_id($rec_id, $is_auth);
   my $datestamp = local_unix_time_to_oai_datetime($date, 1);
   my $deleted = substr($marcdata, 5, 1) eq 'd';
 
   my @setspecs = get_record_sets($dbh, $rec_id, $marcdata, $is_auth, $set, $deleted);
-
-  # Mark record deleted if it's suppressed and set doesn't include suppressed records
-  if (!$is_auth && $set && !$deleted)
-  {
-    my $record_suppressed = -1;
-    foreach my $single_set (@{$config{'sets'}})
-    {
-      if ($set eq $single_set->{'id'})
-      {
-        if (defined($single_set->{'suppressed'}) && $single_set->{'suppressed'} == 0)
-        {
-          if (!defined($global_bib_info_sth))
-          {
-            $global_bib_info_sth = $dbh->prepare("select suppress_in_opac from ${db_tablespace}bib_master bib where bib_id=?");
-          }
-          $global_bib_info_sth->execute($rec_id) || die($dbh->errstr);
-          my @row = $global_bib_info_sth->fetchrow_array();
-          $global_bib_info_sth->finish();
-          $deleted = 1 if ($row[0] eq 'Y');
-        }
-        last;
-      }
-    }
-  }
 
   $deleted = $deleted ? ' status="deleted"' : '';
   my $str = qq|    <header$deleted>
@@ -1388,11 +1476,26 @@ sub create_record($$$$$$$$)
     {
       if (!defined($global_mfhd_sth))
       {
-        my $suppressed = '';
+        my $mfhd_where = '';
         if (!$config{'include_suppressed_holdings'})
         {
-          $suppressed = "and MFHD_ID in (select MM.MFHD_ID from ${db_tablespace}MFHD_MASTER MM WHERE MM.MFHD_ID=BM.MFHD_ID and MM.SUPPRESS_IN_OPAC='N') AND loc.suppress_in_opac='N'";
+          $mfhd_where = "and mfhd.suppress_in_opac='N' AND loc.suppress_in_opac='N'";
         }
+        if (!defined($current_setspec) && scalar(@setspecs) > 0)
+        {
+          # Use the first matching set as the current one when filtering holdings
+          $current_setspec = get_set_by_name($setspecs[0]);
+        }
+        if (defined($current_setspec) && $current_setspec->{'locations'})
+        {
+          my ($location_rule, $only_exclusions) = create_location_rule('mfhd.location_id', $current_setspec->{'locations'});
+          $mfhd_where .= "and $location_rule";
+        }
+        if (defined($current_setspec) && $current_setspec->{'mfhd_callno'})
+        {
+          $mfhd_where .= "and NORMALIZED_CALL_NO like '" . $current_setspec->{'mfhd_callno'} . "'";
+        }
+
         $global_mfhd_sth = $dbh->prepare(qq|
 select mfhd.mfhd_id, mfhd.suppress_in_opac, loc.location_code, loc.location_display_name, lib.library_name
   from ${db_tablespace}mfhd_master mfhd
@@ -1400,8 +1503,7 @@ select mfhd.mfhd_id, mfhd.suppress_in_opac, loc.location_code, loc.location_disp
   left outer join ${db_tablespace}library lib on (loc.library_id = lib.library_id)
   where mfhd.mfhd_id in (select bm.mfhd_id
     from ${db_tablespace}bib_mfhd bm
-    where bib_id=?
-    $suppressed
+    where bib_id=? $mfhd_where
   )
 |) || die($dbh->errstr);
 
@@ -1937,7 +2039,7 @@ sub get_record_sets($$$$$$)
   my @setlist = ();
   push(@setlist, $current_set) if ($current_set);
 
-  return @setlist if (scalar(@sets) < 2);
+  return @setlist if ($current_set && scalar(@sets) < 2);
 
   if ($is_auth)
   {
@@ -1977,35 +2079,8 @@ sub get_record_sets($$$$$$)
           debug_out("get_record_sets: host item for bib $rec_id: $host_bib_id", 1);
         }
 
-        my $rule_operator = ' and ';
-        $rule_operator = ' or ' if ($set->{'rule_operator'} && $set->{'rule_operator'} eq 'or');
-        my $rec_formats = $set->{'rec_formats'};
-        my $locations = $set->{'locations'};
-        my $create_locations = $set->{'create_locations'};
-        my $happening_locations = $set->{'happening_locations'};
-        my $mfhd_callno = $set->{'mfhd_callno'};
-        my $pub_places = $set->{'pub_places'};
-        my $languages = $set->{'languages'};
-        my $suppressed = $set->{'suppressed'};
-
-        if (!defined($set->{'bib_sth'}))
-        {
-          my $sql_where = create_sql_rules($rule_operator, $rec_formats, $locations, $create_locations, $happening_locations, $mfhd_callno, $pub_places, $languages, $suppressed);
-          debug_out("get_record_sets: $rec_id sql rules: $sql_where", 1);
-          if ($sql_where)
-          {
-            $set->{'bib_sth'} = $dbh->prepare("select ID from (select BIB_ID as ID from ${db_tablespace}BIB_MASTER where BIB_ID=?) where $sql_where") || die $dbh->errstr;
-          }
-        }
-        if (defined($set->{'bib_sth'}))
-        {
-          $set->{'bib_sth'}->execute($component_parts == 2 ? $host_bib_id : $rec_id) || die $dbh->errstr;
-
-          my $bib_found = $set->{'bib_sth'}->fetchrow_array();
-          $set->{'bib_sth'}->finish();
-          next if (!$bib_found);
-        }
-        debug_out("get_record_sets: $rec_id passed sql rules", 1);
+        next unless match_record($dbh, \$set, $rec_id);
+        debug_out("get_record_sets: $rec_id passed other rules", 1);
 
         my $keyword = $set->{'keyword'};
         my $filter = $set->{'filter'};
@@ -2413,7 +2488,9 @@ sub check_params($)
   my @params = param();
   foreach my $param (@params)
   {
+    $CGI::LIST_CONTEXT_WARN = 0;
     my @paramlist = param($param);
+    $CGI::LIST_CONTEXT_WARN = 1;
     if (scalar(@paramlist) > 1)
     {
       send_http_headers();
@@ -2780,4 +2857,89 @@ sub read_marc_record($$)
     return $record;
   }
   return '';
+}
+
+sub find_marc_file_pos($$)
+{
+  my ($fh, $from) = @_;
+
+  my $filestat = stat($fh);
+  if ($filestat->size < 100000)
+  {
+    return 0;
+  }
+
+  debug_out("Trying to find correct position in deletion file (" . $filestat->size . " bytes)", 1);
+  my $position = int($filestat->size / 2);
+  my $last_smaller_pos = 0;
+  my $seek = $position;
+  my $iteration = 0;
+  while ($position > 100000 && $iteration++ < 30)
+  {
+    debug_out("Seeking to $position", 1);
+    if (!sysseek($fh, $position, SEEK_SET)) {
+      debug_out("Seek failed, canceling search", 1);
+      return 0;
+    }
+    # Find next record and check its timestamp
+    my $ch = ' ';
+    while (sysread($fh, $ch, 1) == 1)
+    {
+      ++$position;
+      last if ($ch eq $record_end);
+    }
+    if ($ch ne $record_end)
+    {
+      debug_out("No next record, canceling search", 1);
+      return 0;
+    }
+    my $record = read_marc_record($fh, 0);
+    if (!$record)
+    {
+      debug_out("Could not read record, canceling search", 1);
+      return 0;
+
+    }
+    my $f005a = get_field($record, '005');
+    my $del_date = del_date_local_unix_time_to_oai_datetime(substr($f005a, 0, 14));
+    my $del_date_str = local_unix_time_to_oai_datetime($del_date, 1);
+    debug_out("Record at position $position deleted at $del_date_str", 1);
+    my $last_pos = $position;
+    $seek = int($seek / 2);
+    if ($del_date_str ge $from)
+    {
+      $position -= $seek;
+    }
+    else
+    {
+      $last_smaller_pos = $position;
+      $position += $seek;
+      if (abs($last_pos - $position) < 10000)
+      {
+        # Last position was good enough
+        return $last_pos;
+      }
+    }
+  }
+  if ($last_smaller_pos) {
+    debug_out("Returning last smaller pos: $last_smaller_pos", 1);
+    return $last_smaller_pos;
+  }
+  debug_out("No good position found", 1);
+  return 0;
+}
+
+sub get_set_by_name($)
+{
+  my ($set) = @_;
+
+  my @sets = @{$config{'sets'}};
+  foreach my $setspec (@sets)
+  {
+    if ($setspec->{'id'} eq $set)
+    {
+      return $setspec;
+    }
+  }
+  return undef;
 }
