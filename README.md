@@ -37,6 +37,6 @@ You can have multiple oai-pmh scripts in cgi-bin with their own settings. Just c
 
 ## License and copyright
 
-Copyright (c) 2005-2016 University Of Helsinki (The National Library Of Finland)
+Copyright (c) 2005-2018 University Of Helsinki (The National Library Of Finland)
 
 This project's source code is licensed under the terms of **GNU Affero General Public License Version 3**.
