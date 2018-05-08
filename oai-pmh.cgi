@@ -5,7 +5,7 @@
 #
 # OAI-PMH repository script for Voyager
 #
-# Copyright (c) 2005-2016 University Of Helsinki (The National Library Of Finland)
+# Copyright (c) 2005-2018 University Of Helsinki (The National Library Of Finland)
 #
 # This file is part of voyager-oai-pmh-provider
 #
@@ -24,7 +24,7 @@
 #
 
 # Original author: Ere Maijala
-# Version 3.0.0
+# Version 3.0.1
 
 use strict;
 use warnings;
@@ -2259,9 +2259,9 @@ sub normalize_id($)
   my ($str) = @_;
 
   $str = uc($str);
-  $str =~ s/-//g;
+  $str =~ s/-/ /g;
   $str =~ s/[\.\(\)\/\,_]//g;
-  $str =~ s/ $//g;
+  $str =~ s/ +$//g;
   return $str;
 }
 
